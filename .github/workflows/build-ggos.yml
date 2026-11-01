@@ -1,0 +1,147 @@
+name: Build ggOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: "Direct link to a GSI (.img.xz). Must be ext4, not EROFS."
+        required: true
+        default: "https://github.com/TrebleDroid/treble_experimentations/releases/download/ci-20250117/system-td-arm64-ab-vndklite-vanilla.img.xz"
+      version:
+        description: "ggOS version name"
+        required: true
+        default: "1.0"
+
+permissions:
+  contents: write
+
+env:
+  GSI_URL: ${{ inputs.gsi_url }}
+  GGOS_NAME: ggOS ${{ inputs.version }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            android-sdk-libsparse-utils e2fsprogs xz-utils attr
+
+      - name: Download GSI
+        run: curl -fL --retry 5 --retry-delay 5 -o gsi.img.xz "$GSI_URL"
+
+      - name: Unpack GSI
+        run: |
+          xz -d -T0 gsi.img.xz
+          # Convert from Android sparse format to a raw image if needed
+          magic=$(od -An -tx1 -N4 gsi.img | tr -d ' \n')
+          if [ "$magic" = "3aff26ed" ]; then
+            echo "Sparse image detected, converting to raw"
+            simg2img gsi.img gsi.raw.img
+            mv gsi.raw.img gsi.img
+          fi
+          # EROFS (and anything else that is not ext4) is read-only and cannot be edited
+          if ! dumpe2fs -h gsi.img >/dev/null 2>&1; then
+            echo "::error::This GSI is not ext4 (probably EROFS, which is read-only). Pick an ext4 GSI."
+            exit 1
+          fi
+          ls -lh gsi.img
+
+      - name: Prepare filesystem for read-write mount
+        run: |
+          # Add headroom so the edited file always fits (shrunk again at the end)
+          truncate -s +128M gsi.img
+          set +e
+          e2fsck -fy gsi.img; rc=$?
+          set -e
+          [ "$rc" -le 1 ] || exit "$rc"
+          resize2fs gsi.img
+          # Images with shared blocks cannot be mounted read-write
+          if dumpe2fs -h gsi.img 2>/dev/null | grep -i '^Filesystem features' | grep -q shared_blocks; then
+            echo "shared_blocks present, unsharing"
+            set +e
+            e2fsck -fy -E unshare_blocks gsi.img; rc=$?
+            set -e
+            [ "$rc" -le 1 ] || exit "$rc"
+          fi
+
+      - name: Mount and edit build.prop in place
+        run: |
+          mkdir mnt
+          sudo mount -o loop,rw gsi.img mnt
+
+          PROP=mnt/system/build.prop
+          [ -f "$PROP" ] || PROP=mnt/build.prop
+          [ -f "$PROP" ] || { echo "build.prop not found"; sudo ls -la mnt; exit 1; }
+          echo "Editing $PROP"
+
+          echo "--- before ---"
+          sudo grep -E '^ro\.build\.(display\.id|description)=' "$PROP" || true
+          before=$(sudo getfattr -h -d -m - -e hex "$PROP" 2>/dev/null || true)
+
+          # Rewrite the file through the same open file handle (r+, seek, truncate)
+          # so the inode, and therefore its SELinux xattr, is untouched.
+          # Do NOT use sed -i: it creates a new inode and drops the label.
+          sudo python3 - "$PROP" "$GGOS_NAME" <<'PY'
+          import re, sys
+          path, name = sys.argv[1], sys.argv[2]
+          with open(path, "r+", encoding="utf-8") as f:
+              text = f.read()
+              for key in ("ro.build.display.id", "ro.build.description"):
+                  pat = re.compile(r"^" + re.escape(key) + r"=.*$", re.M)
+                  if pat.search(text):
+                      text = pat.sub(lambda m: key + "=" + name, text)
+                  else:
+                      text = text.rstrip("\n") + "\n" + key + "=" + name + "\n"
+              f.seek(0)
+              f.write(text)
+              f.truncate()
+          PY
+
+          echo "--- after ---"
+          sudo grep -E '^ro\.build\.(display\.id|description)=' "$PROP"
+          after=$(sudo getfattr -h -d -m - -e hex "$PROP" 2>/dev/null || true)
+
+          echo "--- xattrs ---"
+          echo "$after"
+          if [ "$before" != "$after" ]; then
+            echo "::error::Extended attributes (SELinux label) changed"
+            exit 1
+          fi
+          echo "xattrs unchanged"
+
+          sync
+          sudo umount mnt
+
+      - name: Check and shrink filesystem
+        run: |
+          set +e
+          e2fsck -fy gsi.img; rc=$?
+          set -e
+          [ "$rc" -le 1 ] || exit "$rc"
+          resize2fs -M gsi.img
+          blocks=$(dumpe2fs -h gsi.img 2>/dev/null | awk -F: '/^Block count:/{gsub(/ /,"",$2); print $2}')
+          bsize=$(dumpe2fs -h gsi.img 2>/dev/null | awk -F: '/^Block size:/{gsub(/ /,"",$2); print $2}')
+          truncate -s $((blocks * bsize)) gsi.img
+          e2fsck -fn gsi.img
+          ls -lh gsi.img
+
+      - name: Compress
+        run: |
+          xz -T0 -6 -c gsi.img > system.img.xz
+          sha256sum system.img.xz | tee system.img.xz.sha256
+          ls -lh system.img.xz
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="ggos-${{ inputs.version }}-build${{ github.run_number }}"
+          sha=$(cut -d' ' -f1 system.img.xz.sha256)
+          gh release create "$tag" system.img.xz \
+            --repo "${{ github.repository }}" \
+            --title "ggOS ${{ inputs.version }} (build ${{ github.run_number }})" \
+            --notes "$GGOS_NAME arm64 A/B VNDK-lite GSI, based on TrebleDroid ci-20250117 (system-td-arm64-ab-vndklite-vanilla). Build display id and description set to \"$GGOS_NAME\". Decompress with \`xz -d system.img.xz\` and flash as the system partition. SHA-256 of system.img.xz: \`$sha\`"
