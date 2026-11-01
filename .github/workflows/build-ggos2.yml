@@ -1,0 +1,129 @@
+name: Build ggOS 2 (Android 17)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: "Direct link to a GSI (.img.xz). Must be ext4, not EROFS. Default = Android 16 arm64 A/B 'old vendor' build."
+        required: true
+        default: "https://github.com/TrebleDroid/treble_experimentations/releases/download/ci-20250617/system-td-arm64-vanilla-old.img.xz"
+      version:
+        description: "ggOS version name"
+        default: "1.0"
+
+permissions:
+  contents: write   # lets the job publish a GitHub Release
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y android-sdk-libsparse-utils e2fsprogs xz-utils file
+
+      - name: Download base GSI
+        env:
+          GSI_URL: ${{ inputs.gsi_url }}
+        run: |
+          mkdir work && cd work
+          curl -L --fail -o gsi.img.xz "$GSI_URL"
+          unxz gsi.img.xz
+          mv gsi.img raw.img
+          ls -lh
+
+      - name: Make the image writable
+        run: |
+          cd work
+          # Some GSIs are Android-sparse; convert if so
+          if file -b raw.img | grep -qi "sparse"; then
+            simg2img raw.img raw2.img && mv raw2.img raw.img
+          fi
+          if ! file -s raw.img | grep -qiE "ext[234]"; then
+            echo "::error::This GSI is not ext4 (probably EROFS, which is read-only). Pick an ext4 GSI."
+            exit 1
+          fi
+          # Android 15/16 GSIs share blocks to save space: they are full, and read-only
+          # until unshared. Add room first, then unshare.
+          if dumpe2fs -h raw.img 2>/dev/null | grep -q shared_blocks; then
+            truncate -s +1500M raw.img
+            e2fsck -fy raw.img || true
+            resize2fs raw.img
+            e2fsck -fy -E unshare_blocks raw.img || true
+          fi
+          e2fsck -fn raw.img
+
+      - name: Rebrand as ggOS
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd work
+          sudo mkdir -p /mnt/gg
+          sudo mount -o loop,rw raw.img /mnt/gg
+
+          PROP=/mnt/gg/system/build.prop
+          [ -f "$PROP" ] || PROP=$(sudo find /mnt/gg -maxdepth 2 -name build.prop | head -1)
+          [ -n "$PROP" ] || { echo "::error::build.prop not found"; exit 1; }
+          echo "Editing $PROP"
+
+          # Edit in place (same inode) so the SELinux label is kept
+          sudo python3 - "$PROP" "$VERSION" <<'EOF'
+          import sys
+          path, version = sys.argv[1], sys.argv[2]
+          want = {"ro.build.display.id": f"ggOS {version}", "ro.build.description": f"ggOS {version}"}
+          with open(path, "r+", newline="") as f:
+              lines = f.read().split("\n")
+              seen = set()
+              for i, l in enumerate(lines):
+                  for k, v in want.items():
+                      if l.startswith(k + "="):
+                          lines[i] = f"{k}={v}"; seen.add(k)
+              for k, v in want.items():
+                  if k not in seen:
+                      lines.append(f"{k}={v}")
+              f.seek(0); f.write("\n".join(lines)); f.truncate()
+          EOF
+          grep -E "^ro.build.(display.id|description)=" "$PROP"
+
+          # Optional: custom boot animation (put bootanimation.zip in the repo root)
+          if [ -f "$GITHUB_WORKSPACE/bootanimation.zip" ]; then
+            sudo mkdir -p /mnt/gg/system/media
+            sudo cp "$GITHUB_WORKSPACE/bootanimation.zip" /mnt/gg/system/media/bootanimation.zip
+            echo "Custom boot animation added."
+          fi
+
+          sudo sync
+          sudo umount /mnt/gg
+
+      - name: Pack images
+        run: |
+          cd work
+          e2fsck -fy raw.img || true
+          resize2fs -M raw.img            # shrink back to the smallest size
+          e2fsck -fn raw.img
+          mkdir out
+          cp raw.img out/ggOS-system.img               # raw ext4: for TWRP "Install Image"
+          img2simg raw.img out/ggOS-system-sparse.img  # sparse: for fastboot
+          xz -T0 -4 -k out/ggOS-system.img
+          sha256sum out/ggOS-system.img out/ggOS-system-sparse.img out/ggOS-system.img.xz | tee out/SHA256SUMS.txt
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ggOS-${{ inputs.version }}
+          path: |
+            work/out/ggOS-system.img.xz
+            work/out/SHA256SUMS.txt
+          retention-days: 14
+
+      - name: Publish GitHub Release (permanent download link)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "ggOS-${{ inputs.version }}-${{ github.run_number }}" \
+            work/out/ggOS-system.img.xz work/out/SHA256SUMS.txt \
+            --title "ggOS ${{ inputs.version }}" \
+            --notes "ggOS ${{ inputs.version }} (Android 16 arm64 GSI). Unzip the .xz with 7-Zip to get system.img."
