@@ -86,7 +86,7 @@ jobs:
                       lines.append(f"{k}={v}")
               f.seek(0); f.write("\n".join(lines)); f.truncate()
           EOF
-          grep -E "^ro.build.(display.id|description)=" "$PROP"
+          sudo grep -E "^ro.build.(display.id|description)=" "$PROP"
 
           # Optional: custom boot animation (put bootanimation.zip in the repo root)
           if [ -f "$GITHUB_WORKSPACE/bootanimation.zip" ]; then
