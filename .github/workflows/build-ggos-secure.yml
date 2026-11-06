@@ -1,0 +1,189 @@
+name: Build ggOS Secure (Android 15)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: "Direct link to the base GSI (.img.xz, ext4). Default = the Android 15 arm64 A/B vndklite GSI we used before."
+        required: true
+        default: "https://github.com/TrebleDroid/treble_experimentations/releases/download/ci-20250117/system-td-arm64-ab-vndklite-vanilla.img.xz"
+      version:
+        description: "ggOS version name"
+        default: "1.0"
+
+permissions:
+  contents: write   # lets the job publish a GitHub Release
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y android-sdk-libsparse-utils e2fsprogs xz-utils file attr
+
+      - name: Download base GSI
+        env:
+          GSI_URL: ${{ inputs.gsi_url }}
+        run: |
+          mkdir work && cd work
+          curl -L --fail -o gsi.img.xz "$GSI_URL"
+          unxz gsi.img.xz
+          mv gsi.img raw.img
+          ls -lh
+
+      - name: Make the image writable
+        run: |
+          cd work
+          if file -b raw.img | grep -qi "sparse"; then
+            simg2img raw.img raw2.img && mv raw2.img raw.img
+          fi
+          if ! file -s raw.img | grep -qiE "ext[234]"; then
+            echo "::error::This GSI is not ext4 (probably EROFS, which is read-only). Pick an ext4 GSI."
+            exit 1
+          fi
+          if dumpe2fs -h raw.img 2>/dev/null | grep -q shared_blocks; then
+            truncate -s +1500M raw.img
+            e2fsck -fy raw.img || true
+            resize2fs raw.img
+            e2fsck -fy -E unshare_blocks raw.img || true
+          fi
+          e2fsck -fn raw.img
+
+      - name: Harden and rebrand as ggOS
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd work
+          sudo mkdir -p /mnt/gg
+          sudo mount -o loop,rw raw.img /mnt/gg
+
+          cat > harden.py <<'PY'
+          import os, sys
+
+          root, version = sys.argv[1], sys.argv[2]
+          report = []
+
+          SET = {"ro.debuggable": "0", "ro.adb.secure": "1", "ro.secure": "1", "ro.build.type": "user"}
+          DROP = {"persist.sys.usb.config"}   # stops adb being switched on by default
+          BRAND = {"ro.build.display.id": f"ggOS {version}", "ro.build.description": f"ggOS {version}"}
+
+          def patch(path, main):
+              # Edit in place (same inode) so the SELinux label is kept
+              with open(path, "r+", newline="") as f:
+                  lines = f.read().split("\n")
+                  out, seen = [], set()
+                  for l in lines:
+                      k = l.split("=", 1)[0] if ("=" in l and not l.lstrip().startswith("#")) else None
+                      if k in SET:
+                          out.append(f"{k}={SET[k]}"); seen.add(k)
+                          if l != f"{k}={SET[k]}": report.append(f"{os.path.relpath(path, root)}: {l}  ->  {k}={SET[k]}")
+                      elif k in DROP:
+                          report.append(f"{os.path.relpath(path, root)}: removed {l}")
+                      elif main and k in BRAND:
+                          out.append(f"{k}={BRAND[k]}"); seen.add(k)
+                      else:
+                          out.append(l)
+                  if main:
+                      for k in ("ro.debuggable", "ro.adb.secure", "ro.secure"):
+                          if k not in seen:
+                              out.insert(len(out) - 1 if out and out[-1] == "" else len(out), f"{k}={SET[k]}")
+                              report.append(f"{os.path.relpath(path, root)}: added {k}={SET[k]}")
+                      for k, v in BRAND.items():
+                          if k not in seen:
+                              out.insert(len(out) - 1 if out and out[-1] == "" else len(out), f"{k}={v}")
+                  f.seek(0); f.write("\n".join(out)); f.truncate()
+
+          main = os.path.join(root, "system/build.prop")
+          if not os.path.isfile(main):
+              sys.exit("build.prop not found")
+          patch(main, True)
+          for dp, dn, fn in os.walk(root):
+              if dp.startswith(os.path.join(root, "lost+found")):
+                  continue
+              for n in fn:
+                  p = os.path.join(dp, n)
+                  if p != main and (n == "build.prop" or n.endswith(".prop")) and os.path.isfile(p) and not os.path.islink(p):
+                      patch(p, False)
+
+          # Remove the root helper (su binary, phh-su daemon, and the init script that starts it)
+          for dp, dn, fn in os.walk(os.path.join(root, "system")):
+              for n in fn:
+                  if n in ("su", "phh-su", "su.rc"):
+                      p = os.path.join(dp, n)
+                      os.remove(p); report.append(f"removed {os.path.relpath(p, root)}")
+
+          open(sys.argv[3], "w").write("\n".join(report) + "\n")
+          PY
+          sudo python3 harden.py /mnt/gg "$VERSION" hardening-changes.txt
+          cat hardening-changes.txt
+
+          # ---- Verify. The build fails if any check does not pass. ----
+          FAIL=0
+          chk() { if eval "$2"; then echo "PASS  $1"; else echo "FAIL  $1"; FAIL=1; fi; }
+          B=/mnt/gg/system/build.prop
+          chk "ro.debuggable=0"            "sudo grep -q '^ro.debuggable=0$' $B"
+          chk "ro.secure=1"                "sudo grep -q '^ro.secure=1$' $B"
+          chk "ro.adb.secure=1 everywhere" "! sudo grep -rqs '^ro.adb.secure=0' /mnt/gg --include=*.prop"
+          chk "adb not on by default"      "! sudo grep -q '^persist.sys.usb.config=adb' $B"
+          chk "no su binary"               "[ -z \"\$(sudo find /mnt/gg/system -type f \\( -name su -o -name phh-su -o -name su.rc \\))\" ]"
+          chk "no setuid files"            "[ -z \"\$(sudo find /mnt/gg/system -xdev -type f -perm -4000)\" ]"
+          chk "ggOS branding"              "sudo grep -q '^ro.build.display.id=ggOS ' $B"
+          [ "$FAIL" = 0 ] || { echo "::error::Hardening checks failed"; exit 1; }
+
+          if [ -f "$GITHUB_WORKSPACE/bootanimation.zip" ]; then
+            sudo mkdir -p /mnt/gg/system/media
+            sudo cp "$GITHUB_WORKSPACE/bootanimation.zip" /mnt/gg/system/media/bootanimation.zip
+            echo "Custom boot animation added."
+          fi
+
+          sudo sync
+          sudo umount /mnt/gg
+          e2fsck -fy raw.img || true
+          resize2fs -M raw.img
+          e2fsck -fn raw.img
+
+      - name: Pack images and security report
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd work
+          mkdir out
+          cp raw.img out/ggOS-system.img               # raw ext4: for TWRP "Install Image"
+          img2simg raw.img out/ggOS-system-sparse.img  # sparse: for fastboot
+          xz -T0 -4 -k out/ggOS-system.img
+          {
+            echo "ggOS $VERSION Secure - what was changed"
+            echo "======================================"
+            cat hardening-changes.txt
+            echo
+            echo "Still true (cannot be fixed on a GSI):"
+            echo " - Signed with the public AOSP test keys (ro.build.tags=test-keys). Only install apps you trust."
+            echo " - Bootloader must be unlocked and boot verification disabled to flash it."
+            echo " - Security patch level is that of the base GSI (2024-12-05 for the default image)."
+            echo " - Not a certified or supported Android build."
+          } > out/SECURITY-REPORT.txt
+          sha256sum out/ggOS-system.img out/ggOS-system-sparse.img out/ggOS-system.img.xz | tee out/SHA256SUMS.txt
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ggOS-secure-${{ inputs.version }}
+          path: |
+            work/out/ggOS-system.img.xz
+            work/out/SHA256SUMS.txt
+            work/out/SECURITY-REPORT.txt
+          compression-level: 0
+          retention-days: 14
+
+      - name: Publish GitHub Release (permanent download link)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "ggOS-secure-${{ inputs.version }}-${{ github.run_number }}" \
+            work/out/ggOS-system.img.xz work/out/SHA256SUMS.txt work/out/SECURITY-REPORT.txt \
+            --title "ggOS ${{ inputs.version }} Secure (Android 15)" \
+            --notes "Hardened Android 15 arm64 GSI: root helper removed, debugging locked down. See SECURITY-REPORT.txt for what changed and what cannot be fixed."
